@@ -621,9 +621,15 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 "block or produce infinite output.")
 
         _resolved = _resolve_path_for_task(path, task_id)
+        file_ops = _get_file_ops(task_id)
+        from tools.file_tools_retention import persisted_result_read_error
+
+        retention_error = persisted_result_read_error(path, _resolved, file_ops, task_id)
+        if retention_error is not None:
+            return retention_error
 
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
-        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+        if _file_ops_uses_host_paths(file_ops):
             kind = _special_file_kind(_resolved)
             if kind is not None:
                 return json.dumps({

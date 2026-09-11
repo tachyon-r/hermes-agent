@@ -45,6 +45,7 @@ Defense against context-window overflow operates at three levels:
 import hashlib
 import logging
 import os
+import posixpath
 import re
 import shlex
 import stat
@@ -60,6 +61,7 @@ STORAGE_DIR = "/tmp/hermes-results"
 SPILLOVER_SUBDIR = "cache/spillover"
 PERSISTED_SPILLOVER_SUBDIR = "tool-results"
 SPILLOVER_MAX_AGE_HOURS = 24
+RESULT_TTL_DAYS = 7
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
@@ -132,6 +134,31 @@ def _prune_spillover_once() -> None:
         logger.debug("Spillover prune failed: %s", exc)
 
 
+def _expire_host_spillover_on_access(path) -> bool | None:
+    """Delete an expired canonical host spill before it is served.
+
+    Returns ``True`` when an expired file was removed, ``False`` when a regular
+    file is still current (or already absent), and ``None`` when the path cannot
+    be verified safely. Symlinks and other non-regular files fail closed.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_mtime >= time.time() - (SPILLOVER_MAX_AGE_HOURS * 3600):
+        return False
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return None
+    return True
 
 
 def _is_host_side_env(env) -> bool:
@@ -254,7 +281,8 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     # ACLs before applying and verifying the private mode. POSIX ACLs are
     # constrained by the mode bits, and setfacl removes any residual entries
     # where available. Reject a symlinked or foreign-owned leaf directory
-    # before writing beneath a shared temp root.
+    # before writing beneath a shared temp root. Cleanup is deliberately
+    # best-effort: a backend without a compatible `find` must still persist.
     cmd = (
         "umask 077 && "
         f"[ ! -L {quoted_dir} ] && mkdir -p {quoted_dir} && "
@@ -264,6 +292,9 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
         "elif command -v setfacl >/dev/null 2>&1; then "
         f"setfacl -b -k {quoted_dir}; fi && "
         f"chmod 700 {quoted_dir} && "
+        f"(find {quoted_dir} \\( -type f -o -type l \\) "
+        f"-name '*.txt' -mtime +{RESULT_TTL_DAYS - 1} "
+        "-exec rm -f {} + 2>/dev/null || true) && "
         f"rm -f {quoted_path} && cat > {quoted_path} && "
         f"if [ \"$(uname -s 2>/dev/null)\" = Darwin ]; then "
         f"chmod -N {quoted_path}; "
@@ -276,8 +307,50 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     return env.execute(cmd, timeout=30, stdin_data=content).get("returncode", 1) == 0
 
 
+def _expire_persisted_result_on_access(remote_path: str, env) -> bool | None:
+    """Delete an expired persisted result before it is served.
+
+    Returns ``True`` when an existing result was expired and removed, ``False``
+    when the retention probe completed and the result is still current, and
+    ``None`` when expiry or deletion could not be verified. Callers restrict
+    this helper to the active environment's resolved ``hermes-results``
+    directory and must fail closed on ``None``.
+    """
+    quoted_path = shlex.quote(remote_path)
+    quoted_dir = shlex.quote(posixpath.dirname(remote_path))
+    cmd = (
+        f"[ ! -L {quoted_dir} ] && [ -d {quoted_dir} ] && "
+        f"expired=$(find {quoted_path} -prune \\( -type f -o -type l \\) "
+        f"-mtime +{RESULT_TTL_DAYS - 1} -print -quit 2>/dev/null) && "
+        "if [ -n \"$expired\" ]; then "
+        f"rm -f {quoted_path} && printf '%s' expired; "
+        "fi"
+    )
+    result = env.execute(cmd, timeout=30)
+    if result.get("returncode", 1) != 0:
+        return None
+    output = result.get("output", result.get("stdout", ""))
+    return output.strip() == "expired"
 
 
+def _expire_remote_spillover_on_access(remote_path: str, env) -> bool | None:
+    """Delete an expired sandbox-visible canonical spill before serving it."""
+    quoted_path = shlex.quote(remote_path)
+    quoted_dir = shlex.quote(posixpath.dirname(remote_path))
+    max_age_minutes = SPILLOVER_MAX_AGE_HOURS * 60
+    cmd = (
+        f"[ ! -L {quoted_dir} ] && [ -d {quoted_dir} ] && "
+        f"expired=$(find {quoted_path} -prune \\( -type f -o -type l \\) "
+        f"-mmin +{max_age_minutes - 1} -print -quit 2>/dev/null) && "
+        "if [ -n \"$expired\" ]; then "
+        f"rm -f {quoted_path} && printf '%s' expired; "
+        "fi"
+    )
+    result = env.execute(cmd, timeout=30)
+    if result.get("returncode", 1) != 0:
+        return None
+    output = result.get("output", result.get("stdout", ""))
+    return output.strip() == "expired"
 
 
 def _build_persisted_message(preview: str, has_more: bool, original_size: int,
